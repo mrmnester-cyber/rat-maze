@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Martie's Maze</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;overflow:hidden;height:100vh;display:flex;flex-direction:column;font-family:monospace}
+#hud{height:60px;flex-shrink:0;background:#000;border-bottom:2px solid #0f0;display:flex;justify-content:space-around;align-items:center;padding:0 20px;box-shadow:0 0 20px #0f0;z-index:10}
+.hi{color:#0f0;font-family:'Courier New',monospace;font-weight:bold;letter-spacing:3px;font-size:17px;text-transform:uppercase;text-shadow:0 0 12px #0f0,0 0 25px #0f0}
+#title{font-size:22px;animation:glitch 3s infinite}
+@keyframes glitch{0%,100%{text-shadow:0 0 12px #0f0,0 0 25px #0f0}30%{text-shadow:2px 0 12px #0f0,-2px 0 12px #0f0,0 0 25px #0f0}60%{text-shadow:-1px 0 12px #0f0,1px 0 12px #0f0,0 0 25px #0f0}}
+#tbox{animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{text-shadow:0 0 12px #0f0}50%{text-shadow:0 0 25px #0f0,0 0 40px #0f0}}
+.warn{animation:wflash 0.45s infinite!important}
+@keyframes wflash{0%,100%{color:#0f0;text-shadow:0 0 12px #0f0}50%{color:#f00;text-shadow:0 0 15px #f00,0 0 30px #f00}}
+#cw{position:relative;flex:1;overflow:hidden}
+canvas{display:block;filter:blur(0.25px)}
+.crt{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none}
+#co1{opacity:0.35;background:repeating-linear-gradient(0deg,rgba(0,255,0,0.03) 0,rgba(0,255,0,0.03) 1px,transparent 1px,transparent 3px);animation:sa 5s linear infinite}
+#co2{opacity:0.15;background:repeating-linear-gradient(90deg,rgba(0,0,0,0.35) 0,transparent 1px,rgba(0,0,0,0.35) 2px,transparent 3px);animation:sb 8s linear infinite}
+@keyframes sa{to{transform:translateY(9px)}}
+@keyframes sb{to{transform:translateX(6px)}}
+</style>
+</head>
+<body>
+<div id="hud">
+  <div class="hi" id="title">MARTIE'S MAZE</div>
+  <div class="hi">LEVEL:&nbsp;<span id="lv">0</span></div>
+  <div class="hi" id="tbox">TIME:&nbsp;<span id="tm">99</span></div>
+  <div class="hi">TRIES:&nbsp;<span id="at">1</span>/3</div>
+</div>
+<div id="cw">
+  <canvas id="c"></canvas>
+  <div class="crt" id="co1"></div>
+  <div class="crt" id="co2"></div>
+</div>
+<script>
+const cv=document.getElementById('c'),cx=cv.getContext('2d');
+
+// ─── AUDIO ───────────────────────────────────────────────────────
+const AC=new(window.AudioContext||window.webkitAudioContext)();
+let boopIv=null,boopMs=500;
+
+function boop(){
+  const o=AC.createOscillator(),g=AC.createGain();
+  o.connect(g);g.connect(AC.destination);
+  o.frequency.value=440;o.type='square';
+  g.gain.setValueAtTime(0.08,AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001,AC.currentTime+0.09);
+  o.start(AC.currentTime);o.stop(AC.currentTime+0.1);
+}
+function startBoop(){stopBoop();boopIv=setInterval(boop,boopMs);}
+function stopBoop(){if(boopIv){clearInterval(boopIv);boopIv=null;}}
+function chime(pairs,type='sine'){
+  pairs.forEach(([f,t])=>{
+    const o=AC.createOscillator(),g=AC.createGain();
+    o.connect(g);g.connect(AC.destination);
+    o.frequency.value=f;o.type=type;
+    g.gain.setValueAtTime(0.18,AC.currentTime+t);
+    g.gain.exponentialRampToValueAtTime(0.001,AC.currentTime+t+0.28);
+    o.start(AC.currentTime+t);o.stop(AC.currentTime+t+0.3);
+  });
+}
+const winChime=()=>chime([[523,0],[659,0.1],[784,0.2],[1047,0.3]]);
+const loseChime=()=>chime([[440,0],[349,0.08],[262,0.18],[196,0.28]],'sawtooth');
+
+// ─── STATE ───────────────────────────────────────────────────────
+let level=0,attempts=1,wrongTurns=0,prevOnPath=true;
+let ratOp=1,ratGl=25;
+let W=0,H=0,CS=0;
+let cells=[],startC={x:0,y:0},goalC={x:0,y:0},pathSet=new Set();
+let savedCells=null,savedStart=null,savedGoal=null,savedPath=null;
+let PX=0,PY=0,DX=0,DY=0,ang=0,fr=0;
+let mq=[],dead=false;
+let timeLeft=99,timerIv=null;
+const LERP=0.62,Q_THR=0.45;
+const OP=[1,0.82,0.62,0.42,0.22,0.09];
+const GL=[25,20,14,8,3,0];
+
+// ─── SHAPE ───────────────────────────────────────────────────────
+function inShape(x,y,W,H,shape){
+  const nx=x/(W-1)*2-1, ny=y/(H-1)*2-1;
+  switch(shape){
+    case 'circle': return nx*nx+ny*ny<=0.93;
+    case 'diamond': return Math.abs(nx)+Math.abs(ny)<=0.96;
+    case 'triangle': return ny>=-0.88+Math.abs(nx)*1.76;
+    default: return true;
+  }
+}
+
+// ─── MAZE GEN (wall-based, iterative DFS, guaranteed connected) ──
+function genMaze(W,H,shape,xtra){
+  const g=Array.from({length:H},(_,y)=>Array.from({length:W},(_,x)=>({e:true,s:true,a:inShape(x,y,W,H,shape)})));
+  const act=[];
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++)if(g[y][x].a)act.push([x,y]);
+  if(!act.length)return g;
+
+  // Pick start near center
+  const cx2=W>>1,cy2=H>>1;
+  let sx=act[0][0],sy=act[0][1],best=1e9;
+  for(const[ax,ay]of act){const d=(ax-cx2)**2+(ay-cy2)**2;if(d<best){best=d;sx=ax;sy=ay;}}
+
+  const vis=Array.from({length:H},()=>Array(W).fill(false));
+  vis[sy][sx]=true;
+  const stk=[[sx,sy]];
+
+  function sh(a){for(let i=a.length-1;i>0;i--){const j=0|Math.random()*(i+1);[a[i],a[j]]=[a[j],a[i]];}return a;}
+
+  while(stk.length){
+    const[x,y]=stk[stk.length-1];
+    const dirs=sh([[1,0],[-1,0],[0,1],[0,-1]]);
+    let mv=false;
+    for(const[dx,dy]of dirs){
+      const nx=x+dx,ny=y+dy;
+      if(nx>=0&&nx<W&&ny>=0&&ny<H&&g[ny][nx].a&&!vis[ny][nx]){
+        if(dx===1) g[y][x].e=false;
+        if(dx===-1) g[y][nx].e=false;
+        if(dy===1) g[y][x].s=false;
+        if(dy===-1) g[ny][x].s=false;
+        vis[ny][nx]=true;
+        stk.push([nx,ny]);
+        mv=true;
+        break;
+      }
+    }
+    if(!mv)stk.pop();
+  }
+
+  // Extra passages for loops/complexity
+  const n=Math.floor(act.length*xtra);
+  for(let i=0;i<n;i++){
+    const[x,y]=act[0|Math.random()*act.length];
+    if(Math.random()<0.5){if(x<W-1&&g[y][x+1].a)g[y][x].e=false;}
+    else{if(y<H-1&&g[y+1][x].a)g[y][x].s=false;}
+  }
+  return g;
+}
+
+// ─── MOVEMENT CHECKS ─────────────────────────────────────────────
+function canMove(x,y,dx,dy){
+  const nx=x+dx,ny=y+dy;
+  if(nx<0||nx>=W||ny<0||ny>=H||!cells[ny][nx].a)return false;
+  if(dx===1) return!cells[y][x].e;
+  if(dx===-1)return!cells[y][nx].e;
+  if(dy===1) return!cells[y][x].s;
+  if(dy===-1)return!cells[ny][x].s;
+  return false;
+}
+
+// ─── BFS ─────────────────────────────────────────────────────────
+function bfsDist(sx,sy){
+  const d=new Map();d.set(`${sx},${sy}`,0);
+  const q=[[sx,sy,0]];
+  while(q.length){
+    const[x,y,v]=q.shift();
+    for(const[dx,dy]of[[1,0],[-1,0],[0,1],[0,-1]]){
+      const nx=x+dx,ny=y+dy,k=`${nx},${ny}`;
+      if(!d.has(k)&&canMove(x,y,dx,dy)){d.set(k,v+1);q.push([nx,ny,v+1]);}
+    }
+  }
+  return d;
+}
+
+function bfsPath(sx,sy,ex,ey){
+  const prev=new Map();prev.set(`${sx},${sy}`,null);
+  const q=[[sx,sy]];
+  while(q.length){
+    const[x,y]=q.shift();
+    if(x===ex&&y===ey)break;
+    for(const[dx,dy]of[[1,0],[-1,0],[0,1],[0,-1]]){
+      const nx=x+dx,ny=y+dy,k=`${nx},${ny}`;
+      if(!prev.has(k)&&canMove(x,y,dx,dy)){prev.set(k,`${x},${y}`);q.push([nx,ny]);}
+    }
+  }
+  const s=new Set();let k=`${ex},${ey}`;
+  while(k!==null){s.add(k);k=prev.get(k)||null;}
+  return s;
+}
+
+// ─── TIMER ───────────────────────────────────────────────────────
+function startTimer(){
+  stopTimer();timeLeft=99;updTimer();
+  timerIv=setInterval(()=>{
+    timeLeft--;updTimer();
+    const el=99-timeLeft;
+    if(el>0&&el%10===0){boopMs=Math.max(80,500-Math.floor(el/10)*50);startBoop();}
+    if(timeLeft<=0){stopTimer();loseChime();setTimeout(doReset,800);}
+  },1000);
+}
+function stopTimer(){if(timerIv){clearInterval(timerIv);timerIv=null;}}
+function updTimer(){
+  const el=document.getElementById('tm');
+  el.textContent=String(timeLeft).padStart(2,'0');
+  document.getElementById('tbox').classList.toggle('warn',timeLeft<20);
+}
+
+// ─── GAME INIT ───────────────────────────────────────────────────
+function initGame(reuse){
+  dead=false;mq=[];fr=0;wrongTurns=0;prevOnPath=true;ratOp=1;ratGl=25;boopMs=500;
+
+  cv.width=window.innerWidth;
+  cv.height=window.innerHeight-60;
+
+  if(!reuse){
+    const shapes=['square','square','circle','diamond','triangle'];
+    const shape=shapes[0|Math.random()*shapes.length];
+    const comp=Math.abs(level);
+    W=Math.min(58,30+comp*3)|1;
+    H=Math.min(42,22+comp*2)|1;
+    CS=Math.max(9,Math.min(Math.floor((cv.width-8)/W),Math.floor((cv.height-8)/H)));
+    const xtra=Math.min(0.22,0.07+comp*0.015);
+    cells=genMaze(W,H,shape,xtra);
+
+    // Find active cells
+    const act=[];
+    for(let y=0;y<H;y++)for(let x=0;x<W;x++)if(cells[y][x].a)act.push({x,y});
+    startC=act[0]||{x:1,y:1};
+
+    // Temporarily set PX/PY so canMove works
+    PX=startC.x;PY=startC.y;
+    const dist=bfsDist(startC.x,startC.y);
+    let mx=0;goalC=act[act.length-1]||{x:W-2,y:H-2};
+    for(const p of act){const v=dist.get(`${p.x},${p.y}`)||0;if(v>mx){mx=v;goalC=p;}}
+
+    pathSet=bfsPath(startC.x,startC.y,goalC.x,goalC.y);
+    savedCells=cells;savedStart={...startC};savedGoal={...goalC};savedPath=pathSet;
+  } else {
+    cells=savedCells;startC={...savedStart};goalC={...savedGoal};pathSet=savedPath;
+    CS=Math.max(9,Math.min(Math.floor((cv.width-8)/W),Math.floor((cv.height-8)/H)));
+  }
+
+  PX=startC.x;PY=startC.y;DX=PX;DY=PY;ang=0;
+  document.getElementById('lv').textContent=level;
+  document.getElementById('at').textContent=attempts;
+  startTimer();startBoop();
+}
+
+function doWin(){stopTimer();stopBoop();winChime();level++;attempts=1;setTimeout(()=>initGame(false),900);}
+function doReset(){
+  stopTimer();stopBoop();
+  attempts++;
+  if(attempts>3){level--;attempts=1;setTimeout(()=>initGame(false),100);}
+  else{setTimeout(()=>initGame(true),100);}
+}
+
+// ─── INPUT ───────────────────────────────────────────────────────
+const DIRS={ArrowRight:[1,0,0],ArrowLeft:[-1,0,Math.PI],ArrowDown:[0,1,Math.PI/2],ArrowUp:[0,-1,-Math.PI/2]};
+document.addEventListener('keydown',e=>{
+  if(AC.state==='suspended')AC.resume();
+  if(dead)return;
+  if(DIRS[e.key]){e.preventDefault();if(mq.length<5)mq.push(DIRS[e.key]);}
+});
+
+function execMove(){
+  if(dead||!mq.length)return;
+  const[dx,dy,a]=mq[0];
+  if(canMove(PX,PY,dx,dy)){
+    mq.shift();
+    PX+=dx;PY+=dy;ang=a;
+    const onPath=pathSet.has(`${PX},${PY}`);
+    if(prevOnPath&&!onPath)wrongTurns++;
+    else if(!prevOnPath&&onPath)wrongTurns=Math.max(0,wrongTurns-1);
+    prevOnPath=onPath;
+    ratOp=wrongTurns>=6?0:(OP[wrongTurns]??0.09);
+    ratGl=wrongTurns>=6?0:(GL[wrongTurns]??0);
+    if(wrongTurns>=6){dead=true;loseChime();setTimeout(doReset,900);return;}
+    if(PX===goalC.x&&PY===goalC.y){dead=true;doWin();}
+  } else {
+    mq.shift();execMove();
+  }
+}
+
+function update(){
+  fr++;
+  const rx=PX-DX,ry=PY-DY,rem=Math.abs(rx)+Math.abs(ry);
+  DX+=rx*LERP;DY+=ry*LERP;
+  if(rem<0.02){DX=PX;DY=PY;}
+  if(rem<Q_THR)execMove();
+}
+
+// ─── DRAW ─────────────────────────────────────────────────────────
+function drawMaze(){
+  const ox=(cv.width-W*CS)/2, oy=(cv.height-H*CS)/2;
+  cx.beginPath();
+  cx.strokeStyle='#0f0';cx.lineWidth=1;
+  cx.shadowBlur=5;cx.shadowColor='rgba(0,255,0,0.8)';
+
+  for(let y=0;y<H;y++){
+    for(let x=0;x<W;x++){
+      if(!cells[y][x].a)continue;
+      const px=ox+x*CS, py=oy+y*CS;
+      // North
+      if(y===0||!cells[y-1][x].a){cx.moveTo(px,py);cx.lineTo(px+CS,py);}
+      // West
+      if(x===0||!cells[y][x-1].a){cx.moveTo(px,py);cx.lineTo(px,py+CS);}
+      // East
+      if(x===W-1||!cells[y][x+1]?.a||cells[y][x].e){cx.moveTo(px+CS,py);cx.lineTo(px+CS,py+CS);}
+      // South
+      if(y===H-1||!cells[y+1]?.[x]?.a||cells[y][x].s){cx.moveTo(px,py+CS);cx.lineTo(px+CS,py+CS);}
+    }
+  }
+  cx.stroke();
+  return{ox,oy};
+}
+
+function drawCheese(x,y,r){
+  cx.shadowBlur=18;cx.shadowColor='#0f0';
+  cx.fillStyle='rgba(0,255,0,0.78)';
+  cx.beginPath();
+  cx.moveTo(x-r,y+r);cx.lineTo(x+r,y+r);cx.lineTo(x+r,y-r);
+  cx.closePath();cx.fill();
+  cx.fillStyle='#000';cx.shadowBlur=0;
+  cx.beginPath();
+  cx.arc(x-r*0.28,y,r*0.19,0,Math.PI*2);
+  cx.arc(x+r*0.22,y+r*0.35,r*0.14,0,Math.PI*2);
+  cx.arc(x+r*0.05,y-r*0.38,r*0.11,0,Math.PI*2);
+  cx.arc(x-r*0.1,y+r*0.58,r*0.13,0,Math.PI*2);
+  cx.fill();
+}
+
+function drawRat(x,y,r){
+  if(ratOp<=0)return;
+  const gc=wrongTurns===0?`rgba(0,255,0,${ratOp})`:`rgba(0,${Math.max(55,220-wrongTurns*33)},0,${ratOp})`;
+
+  cx.save();cx.translate(x,y);cx.rotate(ang);
+
+  // Tail - curly animated bezier
+  const tw1=Math.sin(fr*0.09)*r*0.55;
+  const tw2=Math.sin(fr*0.09+1.8)*r*0.4;
+  cx.beginPath();
+  cx.moveTo(-r*0.72,0);
+  cx.bezierCurveTo(-r*1.25,tw1,-r*2.0,tw2,-r*2.5,-tw1*0.5);
+  cx.strokeStyle=`rgba(0,255,0,${ratOp*0.75})`;
+  cx.lineWidth=Math.max(1,r*0.22);cx.lineCap='round';
+  cx.shadowBlur=ratGl*0.5;cx.shadowColor=gc;
+  cx.stroke();
+
+  // Body
+  cx.shadowBlur=ratGl;cx.shadowColor=gc;
+  cx.fillStyle=gc;
+  cx.beginPath();cx.ellipse(0,0,r,r*0.64,0,0,Math.PI*2);cx.fill();
+
+  // Head
+  cx.beginPath();cx.ellipse(r*0.72,0,r*0.54,r*0.47,0,0,Math.PI*2);cx.fill();
+
+  // Ear
+  cx.fillStyle=`rgba(0,${Math.max(55,195-wrongTurns*30)},0,${ratOp*0.9})`;
+  cx.beginPath();cx.ellipse(r*0.5,-r*0.53,r*0.19,r*0.14,-0.3,0,Math.PI*2);cx.fill();
+
+  // Nose
+  cx.fillStyle=gc;cx.shadowBlur=5;
+  cx.beginPath();cx.ellipse(r*1.22,0,r*0.2,r*0.14,0,0,Math.PI*2);cx.fill();
+
+  // Eyes
+  cx.fillStyle='#000';cx.shadowBlur=0;
+  cx.beginPath();
+  cx.arc(r*0.62,-r*0.24,Math.max(1,r*0.13),0,Math.PI*2);
+  cx.arc(r*0.62, r*0.24,Math.max(1,r*0.13),0,Math.PI*2);
+  cx.fill();
+
+  cx.restore();
+}
+
+// ─── RENDER LOOP ─────────────────────────────────────────────────
+function render(){
+  update();
+  cx.fillStyle='#000';cx.fillRect(0,0,cv.width,cv.height);
+
+  const{ox,oy}=drawMaze();
+  drawCheese(ox+goalC.x*CS+CS/2, oy+goalC.y*CS+CS/2, CS*0.41);
+  drawRat(ox+DX*CS+CS/2, oy+DY*CS+CS/2, CS*0.38);
+
+  // Occasional glitch line
+  if(Math.random()>0.987){
+    const gy=Math.random()*cv.height,gh=3+Math.random()*12;
+    try{const sl=cx.getImageData(0,gy,cv.width,gh);cx.putImageData(sl,Math.random()*6-3,gy);}catch(e){}
+  }
+
+  // Subtle green noise (every 2 frames)
+  if(fr%2===0){
+    try{
+      const id=cx.getImageData(0,0,cv.width,cv.height),d=id.data;
+      for(let i=1;i<d.length;i+=32){
+        if(Math.random()>0.991){const n=25+Math.random()*35;d[i]=Math.min(255,d[i]+n);}
+      }
+      cx.putImageData(id,0,0);
+    }catch(e){}
+  }
+
+  requestAnimationFrame(render);
+}
+
+// ─── START ───────────────────────────────────────────────────────
+window.addEventListener('resize',()=>{
+  cv.width=window.innerWidth;cv.height=window.innerHeight-60;
+  CS=Math.max(9,Math.min(Math.floor((cv.width-8)/W),Math.floor((cv.height-8)/H)));
+});
+document.addEventListener('click',()=>{if(AC.state==='suspended')AC.resume();},{once:true});
+document.addEventListener('keydown',()=>{if(AC.state==='suspended')AC.resume();},{once:true});
+
+initGame(false);
+render();
+</script>
+</body>
+</html>
